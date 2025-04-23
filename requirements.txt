@@ -1,0 +1,11 @@
+psutil==5.9.5
+pathlib==1.0.1
+logging==0.5.1.2
+tkinter
+subprocess.run
+datetime
+json
+shutil
+tempfile
+webbrowser
+re 

